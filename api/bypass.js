@@ -1,5 +1,5 @@
-// Vercel serverless function — Node.js runtime
-// Node 18+ trên Vercel có fetch global + Buffer. Không cần dependency ngoài.
+// Vercel serverless function — Node 18+
+// Bypass nhiều shortener VN: link4m, link1s, link5s, yeumoney, shrinkme, shrinkearn
 
 const DEFAULT_HEADERS = {
   "User-Agent":
@@ -7,20 +7,41 @@ const DEFAULT_HEADERS = {
     "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
   Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
-  Referer: "https://link4m.co/",
 };
 
+// ---- cấu hình theo domain ----
+// mỗi entry: base URL, path POST, referer
+const SITE_CONFIG = {
+  "link4m.co":   { origin: "https://link4m.co",   goPath: "/links/go", tokenNames: ["_token", "token", "hash"] },
+  "link4m.com":  { origin: "https://link4m.com",  goPath: "/links/go", tokenNames: ["_token", "token", "hash"] },
+  "link1s.com":  { origin: "https://link1s.com",  goPath: "/links/go", tokenNames: ["_token", "token", "hash"] },
+  "link5s.co":   { origin: "https://link5s.co",   goPath: "/links/go", tokenNames: ["_token", "token", "hash"] },
+  "link5s.com":  { origin: "https://link5s.com",  goPath: "/links/go", tokenNames: ["_token", "token", "hash"] },
+  "yeumoney.com":{ origin: "https://yeumoney.com",goPath: "/links/go", tokenNames: ["_token", "token", "hash"] },
+  "shrinkme.io": { origin: "https://shrinkme.io", goPath: "/links/go", tokenNames: ["_token", "token"] },
+  "shrinkearn.com":{origin: "https://shrinkearn.com",goPath:"/links/go",tokenNames:["_token","token"] },
+};
+
+// fallback nếu domain không có trong bảng
+const GENERIC_CONFIG = {
+  goPath: "/links/go",
+  tokenNames: ["_token", "token", "hash", "csrf", "_csrf"],
+};
+
+// ---- regex trích link ----
 const RE_WINDOW_LOC = /window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i;
 const RE_VAR_URL =
-  /(?:var|let|const)\s+(?:url|link|target|dest|_url)\s*=\s*["']([^"']+)["']/i;
+  /(?:var|let|const)\s+(?:url|link|target|dest|_url|real_url)\s*=\s*["']([^"']+)["']/i;
 const RE_META_REFRESH =
   /<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^;]+;\s*url=([^"']+)["']/i;
 const RE_B64 = /(?:atob|decodeURIComponent)\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)/;
 const RE_RAW_URL = /https?:\/\/[^\s"'<>\\]+/g;
 
 const BAD_DOMAINS = [
-  "link4m.", "link4m.co", "google.", "gstatic.", "doubleclick.",
-  "facebook.", "cloudflare.", "googleapis.", "ads", "banner",
+  "link4m.", "link1s.", "link5s.", "yeumoney.", "shrinkme.", "shrinkearn.",
+  "google.", "gstatic.", "doubleclick.", "facebook.", "cloudflare.",
+  "googleapis.", "ads", "banner", "gstatic", "googlesyndication",
+  "cloudflareinsights",
 ];
 
 function clean(url) {
@@ -31,6 +52,35 @@ function isGood(url) {
   if (!url || !url.startsWith("http")) return false;
   const low = url.toLowerCase();
   return !BAD_DOMAINS.some((b) => low.includes(b));
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function configFor(url) {
+  const host = hostOf(url);
+  // match chính xác
+  if (SITE_CONFIG[host]) return { host, ...SITE_CONFIG[host] };
+  // match theo suffix (sub-domain)
+  for (const key of Object.keys(SITE_CONFIG)) {
+    if (host.endsWith(key)) return { host: key, ...SITE_CONFIG[key] };
+  }
+  // fallback
+  try {
+    const u = new URL(url);
+    return {
+      host,
+      origin: `${u.protocol}//${u.host}`,
+      ...GENERIC_CONFIG,
+    };
+  } catch {
+    throw new Error("URL không hợp lệ.");
+  }
 }
 
 function extractFromHtml(html) {
@@ -58,10 +108,9 @@ function extractFromHtml(html) {
   return null;
 }
 
-function extractToken(html) {
+function extractToken(html, tokenNames) {
   const data = { _method: "POST", adType: "", adUrl: "" };
 
-  // quét <input name="..." value="...">
   const inputRe = /<input\b[^>]*>/gi;
   const inputs = html.match(inputRe) || [];
   for (const tag of inputs) {
@@ -70,8 +119,9 @@ function extractToken(html) {
     if (!nameM) continue;
     const name = nameM[1];
     const val = valM ? valM[1] : "";
-    if (name === "_token" || name === "token" || name === "hash") {
-      data["_token"] = val;
+    if (tokenNames.includes(name)) {
+      data[name] = val;
+      if (!data["_token"]) data["_token"] = val;
     } else if (name === "adType") {
       data["adType"] = val;
     } else if (name === "adUrl") {
@@ -79,9 +129,16 @@ function extractToken(html) {
     }
   }
 
-  // dò trong script nếu form không có
-  const tm = html.match(/_token\s*[:=]\s*["']([^"']+)["']/);
-  if (tm && !data["_token"]) data["_token"] = tm[1];
+  // dò trong script
+  for (const name of tokenNames) {
+    const re = new RegExp(`${name}\\s*[:=]\\s*["']([^"']+)["']`);
+    const tm = html.match(re);
+    if (tm) {
+      data[name] = tm[1];
+      if (!data["_token"]) data["_token"] = tm[1];
+      break;
+    }
+  }
 
   return data;
 }
@@ -97,15 +154,17 @@ async function timedFetch(input, init, timeoutMs = 20000) {
 }
 
 async function bypass(url) {
-  if (!url.includes("link4m.")) {
-    throw new Error("URL không phải link4m.");
-  }
+  const cfg = configFor(url);
+  const baseHeaders = {
+    ...DEFAULT_HEADERS,
+    Referer: cfg.origin + "/",
+  };
 
   let r;
   try {
     r = await timedFetch(url, {
       method: "GET",
-      headers: DEFAULT_HEADERS,
+      headers: baseHeaders,
       redirect: "follow",
     });
   } catch (e) {
@@ -116,17 +175,17 @@ async function bypass(url) {
   const hit1 = extractFromHtml(html1);
   if (hit1) return { original: hit1, method: "html-parse", final_url: r.url };
 
-  const tokenData = extractToken(html1);
+  const tokenData = extractToken(html1, cfg.tokenNames);
   if (tokenData["_token"]) {
-    const goUrl = "https://link4m.co/links/go";
+    const goUrl = cfg.origin + cfg.goPath;
     const body = new URLSearchParams(tokenData).toString();
     try {
       const r2 = await timedFetch(goUrl, {
         method: "POST",
         headers: {
-          ...DEFAULT_HEADERS,
+          ...baseHeaders,
           "X-Requested-With": "XMLHttpRequest",
-          Origin: "https://link4m.co",
+          Origin: cfg.origin,
           Referer: r.url,
           "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         },
@@ -137,24 +196,24 @@ async function bypass(url) {
       const text2 = await r2.text();
       try {
         const j = JSON.parse(text2);
-        const target = j.url || j.link || j.target;
+        const target = j.url || j.link || j.target || j.result;
         if (target && isGood(target)) {
-          return { original: target, method: "links-go-api", final_url: r2.url };
+          return { original: target, method: "go-api", final_url: r2.url };
         }
       } catch { /* not json */ }
 
       const hit2 = extractFromHtml(text2);
       if (hit2) {
-        return { original: hit2, method: "links-go-html", final_url: r2.url };
+        return { original: hit2, method: "go-html", final_url: r2.url };
       }
     } catch { /* fallthrough */ }
   }
 
-  for (const param of ["?get=true", "?go=1", "?short=1"]) {
+  for (const param of ["?get=true", "?go=1", "?short=1", "?api=1"]) {
     try {
       const r3 = await timedFetch(r.url + param, {
         method: "GET",
-        headers: DEFAULT_HEADERS,
+        headers: baseHeaders,
         redirect: "follow",
       });
       const html3 = await r3.text();
@@ -165,16 +224,18 @@ async function bypass(url) {
     } catch { /* continue */ }
   }
 
-  if (isGood(r.url) && !r.url.includes("link4m.")) {
+  const finalHost = hostOf(r.url);
+  if (isGood(r.url) && !BAD_DOMAINS.some((b) => finalHost.includes(b.replace(".", "")))) {
     return { original: r.url, method: "final-redirect", final_url: r.url };
   }
 
-  throw new Error("Không trích được link gốc. link4m có thể đã đổi cấu trúc.");
+  throw new Error(
+    `Không trích được link gốc từ ${cfg.host}. Site có thể đã đổi cấu trúc.`
+  );
 }
 
 // ---- Vercel handler ----
 module.exports = async function handler(req, res) {
-  // CORS cho phép gọi từ domain khác nếu muốn
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -185,7 +246,12 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === "GET") {
-    res.status(200).json({ ok: true, endpoint: "/api/bypass", method: "POST" });
+    res.status(200).json({
+      ok: true,
+      endpoint: "/api/bypass",
+      method: "POST",
+      supported: Object.keys(SITE_CONFIG),
+    });
     return;
   }
 
@@ -194,7 +260,6 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  // Vercel tự parse body JSON nếu Content-Type: application/json
   const body = req.body || {};
   const url = (body.url || "").toString().trim();
 
