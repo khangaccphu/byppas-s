@@ -1,8 +1,10 @@
 {
-  "name": "link4m-bypasser",
+  "name": "bypass-api",
   "version": "1.0.0",
   "private": true,
-  "engines": {
-    "node": ">=18"
-  }
+  "type": "module",
+  "dependencies": {
+    "undici": "^6.19.8"
+  },
+  "engines": { "node": ">=18" }
 }
