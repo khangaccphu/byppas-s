@@ -1,11 +1,74 @@
-// Vercel serverless function
-// Bypass link4m.net (flow: get-advertise → check-captcha)
+// Vercel serverless function — Node 18+
+// Bypass link4m.net với proxy rotation
+
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
-const CAPSOLVER_KEY = process.env.CAPSOLVER_KEY || ""; // set trong Vercel env
+// ---- danh sách proxy ----
+// xoay vòng, thử hết. con nào chết thì bỏ qua.
+const PROXIES = [
+  "http://185.135.69.34:80",
+  "http://47.91.65.23:3128",
+  "http://103.237.102.191:11111",
+  "http://141.144.206.124:1080",
+  "http://94.78.67.171:80",
+  "http://195.26.224.135:80",
+  "http://109.199.119.160:80",
+  "http://195.114.209.50:80",
+  "http://66.151.34.89:80",
+  "http://108.61.29.163:10001",
+];
+
+// đọc env PROXY_URL nếu có (ưu tiên cao nhất — proxy trả tiền)
+const ENV_PROXY = process.env.PROXY_URL || "";
+
+const CAPSOLVER_KEY = process.env.CAPSOLVER_KEY || "";
+
+function allProxies() {
+  const list = ENV_PROXY ? [ENV_PROXY, ...PROXIES] : [...PROXIES];
+  // shuffle
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  return list;
+}
+
+function agentFor(proxyUrl) {
+  return new ProxyAgent({
+    uri: proxyUrl,
+    requestTls: { rejectUnauthorized: false },
+    connect: { timeout: 8000 },
+  });
+}
+
+// fetch với retry qua nhiều proxy
+async function fetchRetry(url, init = {}, { tries = 5, timeoutMs = 12000 } = {}) {
+  const proxies = allProxies().slice(0, tries);
+  let lastErr = null;
+
+  for (const proxy of proxies) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await undiciFetch(url, {
+        ...init,
+        dispatcher: agentFor(proxy),
+        signal: ctrl.signal,
+      });
+      clearTimeout(t);
+      if (r.ok) return { response: r, proxy };
+      lastErr = new Error(`HTTP ${r.status} via ${proxy}`);
+    } catch (e) {
+      clearTimeout(t);
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("Tất cả proxy fail");
+}
 
 function parseAttrs(html) {
   const aliasM = html.match(/data-alias\s*=\s*["']([^"']+)["']/);
@@ -20,8 +83,13 @@ function parseAttrs(html) {
   };
 }
 
+function setCookiesFromResponse(r) {
+  const sc = r.headers.getSetCookie ? r.headers.getSetCookie() : [];
+  return sc.map((c) => c.split(";")[0]).join("; ");
+}
+
 async function getAdvertise(apiDomain, alias, code, cookies) {
-  const r = await fetch(`${apiDomain}/api/campaign/get-advertise`, {
+  const { response } = await fetchRetry(`${apiDomain}/api/campaign/get-advertise`, {
     method: "POST",
     headers: {
       "User-Agent": UA,
@@ -33,46 +101,11 @@ async function getAdvertise(apiDomain, alias, code, cookies) {
     },
     body: new URLSearchParams({ alias, codes: code }).toString(),
   });
-  if (!r.ok) throw new Error(`get-advertise HTTP ${r.status}`);
-  return r.json();
-}
-
-async function solveRecaptcha(sitekey, pageUrl, proxy) {
-  if (!CAPSOLVER_KEY) throw new Error("Chưa set CAPSOLVER_KEY");
-
-  const task = {
-    type: proxy ? "ReCaptchaV2Task" : "ReCaptchaV2TaskProxyLess",
-    websiteURL: pageUrl,
-    websiteKey: sitekey,
-  };
-  if (proxy) task.proxy = proxy;
-
-  const create = await fetch("https://api.capsolver.com/createTask", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clientKey: CAPSOLVER_KEY, task }),
-  }).then((r) => r.json());
-
-  if (!create.taskId) throw new Error(`CapSolver tạo task fail: ${JSON.stringify(create)}`);
-
-  for (let i = 0; i < 40; i++) {
-    await new Promise((r) => setTimeout(r, 2000));
-    const res = await fetch("https://api.capsolver.com/getTaskResult", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientKey: CAPSOLVER_KEY, taskId: create.taskId }),
-    }).then((r) => r.json());
-
-    if (res.status === "ready") {
-      return res.solution.gRecaptchaResponse || res.solution.token;
-    }
-    if (res.errorId) throw new Error(`CapSolver error: ${JSON.stringify(res)}`);
-  }
-  throw new Error("CapSolver timeout");
+  return response.json();
 }
 
 async function checkCaptcha(apiDomain, alias, code, token, cookies) {
-  const r = await fetch(`${apiDomain}/links/check-captcha`, {
+  const { response } = await fetchRetry(`${apiDomain}/links/check-captcha`, {
     method: "POST",
     headers: {
       "User-Agent": UA,
@@ -88,15 +121,44 @@ async function checkCaptcha(apiDomain, alias, code, token, cookies) {
       "g-recaptcha-response": token,
     }).toString(),
   });
-  if (!r.ok) throw new Error(`check-captcha HTTP ${r.status}`);
-  return r.json();
+  return response.json();
 }
 
-function setCookiesFromResponse(r) {
-  // gom set-cookie thành 1 string
-  const sc = r.headers.getSetCookie ? r.headers.getSetCookie() : [];
-  return sc.map((c) => c.split(";")[0]).join("; ");
+async function solveRecaptcha(sitekey, pageUrl) {
+  if (!CAPSOLVER_KEY) throw new Error("Chưa set CAPSOLVER_KEY");
+
+  const create = await fetch("https://api.capsolver.com/createTask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      clientKey: CAPSOLVER_KEY,
+      task: {
+        type: "ReCaptchaV2TaskProxyLess",
+        websiteURL: pageUrl,
+        websiteKey: sitekey,
+      },
+    }),
+  }).then((r) => r.json());
+
+  if (!create.taskId) throw new Error(`CapSolver: ${JSON.stringify(create)}`);
+
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const res = await fetch("https://api.capsolver.com/getTaskResult", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientKey: CAPSOLVER_KEY, taskId: create.taskId }),
+    }).then((r) => r.json());
+
+    if (res.status === "ready") {
+      return res.solution.gRecaptchaResponse || res.solution.token;
+    }
+    if (res.errorId) throw new Error(`CapSolver: ${JSON.stringify(res)}`);
+  }
+  throw new Error("CapSolver timeout");
 }
+
+export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -110,15 +172,14 @@ export default async function handler(req, res) {
 
   const body = req.body || {};
   const url = (body.url || "").toString().trim();
-  const proxy = (body.proxy || "").toString().trim(); // tuỳ chọn
 
   if (!/^https?:\/\/link4m\.(net|com|co)\//.test(url)) {
     return res.status(400).json({ detail: "Chỉ hỗ trợ link4m.net/.com/.co" });
   }
 
   try {
-    // 1. GET page gốc
-    const r1 = await fetch(url, {
+    // 1. GET page với proxy rotation
+    const { response: r1, proxy: usedProxy } = await fetchRetry(url, {
       headers: {
         "User-Agent": UA,
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -126,68 +187,54 @@ export default async function handler(req, res) {
       },
       redirect: "follow",
     });
-    if (!r1.ok) throw new Error(`GET page HTTP ${r1.status}`);
+
     const html1 = await r1.text();
     const cookies = setCookiesFromResponse(r1);
     const { alias, code, apiDomain, sitekey } = parseAttrs(html1);
 
     if (!alias || !code) {
-      // có thể link đã trả luôn
       const direct = html1.match(/window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/);
       if (direct && !direct[1].includes("link4m.")) {
-        return res.json({ original: direct[1], method: "direct-html", final_url: url });
+        return res.json({ original: direct[1], method: "direct-html", final_url: url, proxy: usedProxy });
       }
-      throw new Error("Không tìm thấy alias/code trong HTML.");
+      throw new Error("Không có alias/code trong HTML. Có thể proxy bị CF chặn.");
     }
 
     // 2. get-advertise
     const adv = await getAdvertise(apiDomain, alias, code, cookies);
 
-    // nếu có window_url → đó là link gốc luôn
     if (adv.window_url && !/link4m\./.test(adv.window_url)) {
       return res.json({
         original: adv.window_url,
         method: "get-advertise-window-url",
         final_url: url,
+        proxy: usedProxy,
       });
     }
 
-    // nếu adv.html chứa link gốc (không cần captcha)
     if (adv.html) {
       const m = adv.html.match(/href\s*=\s*["'](https?:\/\/[^"']+)["']/);
       if (m && !/link4m\./.test(m[1])) {
-        return res.json({ original: m[1], method: "advertise-html", final_url: url });
+        return res.json({ original: m[1], method: "advertise-html", final_url: url, proxy: usedProxy });
       }
     }
 
-    // 3. cần captcha → solve
+    // 3. captcha
     if (!CAPSOLVER_KEY) {
-      throw new Error(
-        "Server yêu cầu captcha. Cần set CAPSOLVER_KEY trên Vercel để bypass tự động."
-      );
+      throw new Error("Server yêu cầu captcha. Cần set CAPSOLVER_KEY.");
     }
 
-    const token = await solveRecaptcha(
-      sitekey,
-      `https://link4m.net/go/${alias}`,
-      proxy || null
-    );
-
-    // 4. check-captcha
+    const token = await solveRecaptcha(sitekey, `https://link4m.net/go/${alias}`);
     const check = await checkCaptcha(apiDomain, alias, code, token, cookies);
 
     if (check.success && check.url && !/link4m\./.test(check.url)) {
-      return res.json({
-        original: check.url,
-        method: "captcha-solved",
-        final_url: url,
-      });
+      return res.json({ original: check.url, method: "captcha-solved", final_url: url, proxy: usedProxy });
     }
 
     if (check.html) {
       const m = check.html.match(/href\s*=\s*["'](https?:\/\/[^"']+)["']/);
       if (m && !/link4m\./.test(m[1])) {
-        return res.json({ original: m[1], method: "captcha-html", final_url: url });
+        return res.json({ original: m[1], method: "captcha-html", final_url: url, proxy: usedProxy });
       }
     }
 
